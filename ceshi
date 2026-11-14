@@ -1,0 +1,767 @@
+sh <<'SB_INSTALL' && /bin/bash /etc/sing-box/sb.sh
+set -eu
+
+[ "$(id -u)" -eq 0 ] || {
+    echo "请在 root 用户下运行：sudo -i"
+    exit 1
+}
+
+[ "$(uname -s)" = Linux ] || {
+    echo "此脚本仅支持 Linux。"
+    exit 1
+}
+
+if ! command -v bash >/dev/null 2>&1; then
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash ca-certificates
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y bash ca-certificates
+    else
+        echo "请先安装 bash。"
+        exit 1
+    fi
+fi
+
+umask 077
+sb_import_tmp=$(mktemp /tmp/sb-manager.XXXXXX)
+trap 'rm -f "$sb_import_tmp"' EXIT HUP INT TERM
+
+cat > "$sb_import_tmp" <<'SB_PANEL_CODE'
+#!/usr/bin/env bash
+# sb-manager
+# 基于原 sing-box 多协议脚本整合重写。
+# 支持 Debian/Ubuntu、Alpine OpenRC，以及使用 systemd 的兼容系统。
+
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+umask 077
+
+VERSION="2.0"
+CORE_VERSION="1.14.4"
+
+W="/etc/sing-box"
+SELF="$W/sb.sh"
+LOG="/var/log/sb-manager"
+CORE="$W/bin/sing-box-$CORE_VERSION"
+S="$W/current/state.json"
+
+T=""
+DL=""
+OLD=""
+ROLL=0
+COMMITTED=0
+MIGRATING=0
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '提示：%s\n' "$*" >&2; }
+die()  { printf '错误：%s\n' "$*" >&2; exit 1; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+
+[[ $EUID -eq 0 ]] || die "请使用 root 运行：sudo -i"
+[[ $(uname -s) == Linux ]] || die "仅支持 Linux"
+
+mkdir -p "$W" "$W/bin" "$W/certs" "$W/credentials" \
+         "$W/generations" "$W/exports" "$LOG"
+chmod 700 "$W" "$W/bin" "$W/certs" "$W/credentials" \
+          "$W/generations" "$W/exports" "$LOG"
+
+ask() {
+    REPLY=""
+    IFS= read -r -p "$1" REPLY || exit 0
+}
+
+secret() {
+    REPLY=""
+    IFS= read -r -s -p "$1" REPLY || exit 0
+    printf '\n'
+}
+
+pause_menu() {
+    ask "按回车返回菜单..."
+}
+
+init_system() {
+    if [[ -d /run/systemd/system ]] && has systemctl; then
+        printf 'systemd\n'
+    elif has rc-service && has rc-update; then
+        printf 'openrc\n'
+    else
+        die "需要 systemd 或 OpenRC"
+    fi
+}
+
+dependencies() {
+    local missing=0 x
+    for x in curl jq openssl tar sha256sum ss flock base64; do
+        has "$x" || missing=1
+    done
+    mv --version >/dev/null 2>&1 || missing=1
+    (( missing == 0 )) && return 0
+
+    say "正在安装管理工具依赖..."
+    if has apt-get; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bash curl jq openssl ca-certificates tar coreutils \
+            iproute2 iptables util-linux
+    elif has apk; then
+        apk add --no-cache \
+            bash curl jq openssl ca-certificates tar coreutils \
+            iproute2 iptables util-linux
+    elif has dnf; then
+        dnf install -y \
+            bash curl jq openssl ca-certificates tar coreutils \
+            iproute iptables util-linux
+    else
+        die "未识别包管理器，请安装 curl jq openssl tar coreutils iproute2 iptables util-linux"
+    fi
+
+    for x in curl jq openssl tar sha256sum ss flock base64; do
+        has "$x" || die "缺少依赖：$x"
+    done
+    mv --version >/dev/null 2>&1 || die "需要 GNU coreutils 的 mv"
+}
+
+fetch() {
+    curl --disable --fail --location --silent --show-error \
+        --retry 2 --connect-timeout 15 --max-time 300 "$@"
+}
+
+architecture() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'amd64\n' ;;
+        aarch64|arm64) printf 'arm64\n' ;;
+        i386|i486|i586|i686) printf '386\n' ;;
+        armv7l|armv7) printf 'armv7\n' ;;
+        armv6l) printf 'armv6\n' ;;
+        s390x) printf 's390x\n' ;;
+        riscv64) printf 'riscv64\n' ;;
+        *) die "暂不支持此架构：$(uname -m)" ;;
+    esac
+}
+
+# 从官方 GitHub Release 获取资产及其 SHA256。
+# 资产没有可用 digest 时停止，不执行未校验的下载文件。
+download_verified() {
+    local repo="$1" tag="$2" name="$3" out="$4"
+    local info asset url digest actual
+
+    DL=$(mktemp -d "$W/.download.XXXXXX")
+    info="$DL/release.json"
+
+    fetch -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/releases/tags/$tag" \
+        -o "$info"
+
+    asset=$(jq -c --arg n "$name" \
+        '.assets[] | select(.name == $n)' "$info")
+    [[ -n "$asset" ]] || die "官方版本 $tag 中没有资产：$name"
+
+    url=$(jq -r '.browser_download_url' <<<"$asset")
+    digest=$(jq -r '.digest // empty' <<<"$asset")
+
+    [[ "$digest" =~ ^sha256:[a-fA-F0-9]{64}$ ]] ||
+        die "官方资产未提供可用 SHA256 digest，下载已停止：$name"
+
+    [[ "$url" == https://github.com/"$repo"/releases/download/* ]] ||
+        die "资产下载地址不符合预期"
+
+    say "下载并校验：$name" >&2
+    fetch "$url" -o "$DL/asset"
+
+    actual=$(sha256sum "$DL/asset")
+    actual=${actual%% *}
+    [[ "${actual,,}" == "${digest#sha256:}" ]] ||
+        die "SHA256 校验失败：$name"
+
+    mv "$DL/asset" "$out"
+    rm -rf "$DL"
+    DL=""
+}
+
+ensure_core() {
+    local arch package archive member tempbin
+
+    if [[ -x "$CORE" && -f "$CORE.sha256" ]]; then
+        if sha256sum -c "$CORE.sha256" >/dev/null 2>&1 &&
+           "$CORE" version 2>/dev/null |
+               head -n 1 | grep -Fq "version $CORE_VERSION"; then
+            return 0
+        fi
+    fi
+
+    arch=$(architecture)
+    package="sing-box-$CORE_VERSION-linux-$arch.tar.gz"
+    archive="$W/.core-archive.$$"
+    tempbin="$W/bin/.sing-box.$$"
+
+    download_verified \
+        "SagerNet/sing-box" "v$CORE_VERSION" "$package" "$archive"
+
+    member=$(tar -tzf "$archive" |
+        awk '/\/sing-box$/ {if (!found) {v=$0; found=1}} END {print v}')
+    [[ -n "$member" ]] || die "压缩包中未找到 sing-box"
+
+    tar -xOzf "$archive" "$member" > "$tempbin"
+    chmod 700 "$tempbin"
+
+    "$tempbin" version | head -n 1 |
+        grep -Fq "version $CORE_VERSION" ||
+        die "核心版本检查失败"
+
+    mv -f "$tempbin" "$CORE"
+    sha256sum "$CORE" > "$CORE.sha256"
+    rm -f "$archive"
+}
+
+jget() {
+    jq -r "$1 // empty" "$S"
+}
+
+m() {
+    local filter="$1"
+    shift
+    jq "$@" "$filter" "$T/state.json" > "$T/state.next"
+    mv "$T/state.next" "$T/state.json"
+}
+
+# 敏感字符串通过文件传入 jq，避免出现在 jq 的命令行参数中。
+mstr() {
+    local filter="$1" value="$2"
+    printf '%s' "$value" > "$T/.value"
+    m "$filter" --rawfile v "$T/.value"
+    rm -f "$T/.value"
+}
+
+memory_mb() {
+    local total value limit
+    total=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    [[ "$total" =~ ^[0-9]+$ ]] || total=256
+
+    for limit in \
+        /sys/fs/cgroup/memory.max \
+        /sys/fs/cgroup/memory/memory.limit_in_bytes
+    do
+        if [[ -r "$limit" ]]; then
+            value=$(cat "$limit")
+            if [[ "$value" =~ ^[0-9]+$ && ${#value} -lt 16 ]]; then
+                value=$((value / 1024 / 1024))
+                if (( value > 0 && value < total )); then
+                    total=$value
+                fi
+            fi
+        fi
+    done
+    printf '%s\n' "$total"
+}
+
+new_uuid() {
+    cat /proc/sys/kernel/random/uuid
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+    local p=$((10#$1))
+    (( p >= 1 && p <= 65535 ))
+}
+
+valid_domain() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && ${#1} -le 253 ]]
+}
+
+valid_host() {
+    if [[ "$1" == *:* ]]; then
+        [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]]
+    else
+        valid_domain "$1"
+    fi
+}
+
+uri() {
+    printf '%s' "$1" | jq -sRr '@uri'
+}
+
+b64() {
+    base64 | tr -d '\r\n'
+}
+
+random_port() {
+    local r
+    r=$(openssl rand -hex 2)
+    printf '%s\n' "$((10000 + 16#$r % 50000))"
+}
+
+legacy_value() {
+    local key="$1"
+    [[ -f "$W/meta.conf" ]] || return 0
+    awk -v k="$key" '
+        index($0,k"=\"")==1 && substr($0,length($0),1)=="\"" {
+            print substr($0,length(k)+3,length($0)-length(k)-3)
+            exit
+        }
+    ' "$W/meta.conf"
+}
+
+make_certificate() {
+    local sni="$1" id
+    id=$(new_uuid)
+    CERT_PATH="$W/certs/$id.pem"
+    KEY_PATH="$W/certs/$id.key"
+
+    openssl req -x509 -newkey ec \
+        -pkeyopt ec_paramgen_curve:prime256v1 \
+        -nodes -days 3650 \
+        -subj "/CN=$sni" \
+        -addext "subjectAltName=DNS:$sni" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -keyout "$KEY_PATH" -out "$CERT_PATH" \
+        >"$LOG/certificate.log" 2>&1
+
+    chmod 600 "$CERT_PATH" "$KEY_PATH"
+}
+
+base_state() {
+    local uuid mem sbmem cfmem name
+
+    uuid=$(new_uuid)
+    mem=$(memory_mb)
+    sbmem=$((mem / 3))
+    cfmem=$((mem / 4))
+    (( sbmem < 24 )) && sbmem=24
+    (( cfmem < 24 )) && cfmem=24
+    (( sbmem > 256 )) && sbmem=256
+    (( cfmem > 128 )) && cfmem=128
+    name=$(hostname 2>/dev/null || printf 'Node')
+
+    "$CORE" generate reality-keypair > "$T/keypair"
+    openssl rand -hex 24 > "$T/password"
+    openssl rand -hex 8 > "$T/shortid"
+
+    jq -n \
+        --arg uuid "$uuid" \
+        --arg name "$name" \
+        --arg version "$CORE_VERSION" \
+        --argjson mem "$sbmem" \
+        --argjson cfmem "$cfmem" \
+        --rawfile pair "$T/keypair" \
+        --rawfile password "$T/password" \
+        --rawfile sid "$T/shortid" '
+        def line($label):
+            split("\n") |
+            map(select(startswith($label))) |
+            .[0] // "" |
+            sub("^[^:]*:[ ]*"; "");
+        {
+            schema: 2,
+            core_version: $version,
+            name: $name,
+            listen: "::",
+            addresses: [],
+            defaults: {
+                uuid: $uuid,
+                password: ($password | gsub("[\r\n]";""))
+            },
+            reality: {
+                private_key: ($pair | line("PrivateKey:")),
+                public_key: ($pair | line("PublicKey:")),
+                short_id: ($sid | gsub("[\r\n]";"")),
+                sni: "www.iij.ad.jp"
+            },
+            tls: {
+                mode: "pinned",
+                sni: "sb.local",
+                certificate: "",
+                key: ""
+            },
+            nodes: {},
+            argo: {
+                enabled: true,
+                mode: "quick",
+                domain: "",
+                token: "",
+                credentials: "",
+                tunnel_id: "",
+                edge_address: "",
+                edge_port: 443,
+                version: ""
+            },
+            hy2_hop: {start: 0, end: 0},
+            warp: {
+                enabled: false,
+                endpoint: null,
+                services: []
+            },
+            runtime: {
+                memory_mib: $mem,
+                argo_memory_mib: $cfmem,
+                gogc: 75
+            },
+            firewall: {enabled: true}
+        }
+    ' > "$T/state.json"
+
+    rm -f "$T/keypair" "$T/password" "$T/shortid"
+}
+
+migrate_legacy() {
+    local inbound="$W/conf/inbounds.json"
+    local v addr mode token file cert key public private sni min max
+
+    [[ -f "$inbound" ]] || return 0
+    say "检测到旧版配置，正在读取单用户节点配置..."
+    MIGRATING=1
+
+    jq -e '
+        (.inbounds | type == "array") and
+        all(.inbounds[];
+            (.tag as $tag |
+                ["vless-reality","vmess-ws","hysteria2","tuic",
+                 "anytls","socks5-in","shadowsocks-2022"] |
+                index($tag) != null) and
+            ((.users // []) | length <= 1)
+        )
+    ' "$inbound" >/dev/null ||
+        die "旧配置含自定义标签或多用户配置，已保留原配置，请先手工整理"
+
+    jq '
+        .inbounds |
+        map({
+            key: .tag,
+            value: (
+                {port:.listen_port} +
+                (if .users[0].uuid? then {uuid:.users[0].uuid} else {} end) +
+                (if .users[0].password? then {password:.users[0].password} else {} end) +
+                (if .users[0].username? then {user:.users[0].username} else {} end) +
+                (if .type=="shadowsocks"
+                 then {method:.method,key:.password} else {} end)
+            )
+        }) | from_entries
+    ' "$inbound" > "$T/legacy-nodes.json"
+
+    m '.nodes=$n[0]' --slurpfile n "$T/legacy-nodes.json"
+
+    v=$(legacy_value UUID)
+    [[ -z "$v" ]] || mstr '.defaults.uuid=$v' "$v"
+
+    sni=$(jq -r '
+        [.inbounds[] | select(.tag=="vless-reality") |
+         .tls.server_name][0] // empty' "$inbound")
+    private=$(jq -r '
+        [.inbounds[] | select(.tag=="vless-reality") |
+         .tls.reality.private_key][0] // empty' "$inbound")
+    public=$(legacy_value PUBLIC_KEY)
+
+    if jq -e '.nodes["vless-reality"] != null' "$T/state.json" >/dev/null; then
+        [[ -n "$private" && -n "$public" ]] ||
+            die "旧 Reality 密钥不完整，停止迁移以保护现有节点"
+
+        mstr '.reality.private_key=$v' "$private"
+        mstr '.reality.public_key=$v' "$public"
+        mstr '.reality.sni=$v' "${sni:-www.iij.ad.jp}"
+
+        v=$(jq -r '
+            [.inbounds[] | select(.tag=="vless-reality") |
+             .tls.reality.short_id[0]][0] // ""' "$inbound")
+        mstr '.reality.short_id=$v' "$v"
+    fi
+
+    v=$(jq -r '[.inbounds[].listen][0] // "::"' "$inbound")
+    mstr '.listen=$v' "$v"
+
+    mode=$(legacy_value STACK_MODE)
+    m '.addresses=[]'
+    case "$mode" in
+        v4) addr=$(legacy_value NODE_IPV4) ;;
+        v6) addr=$(legacy_value NODE_IPV6) ;;
+        custom) addr=$(legacy_value CUSTOM_NODE_IP) ;;
+        *)
+            addr="$(legacy_value NODE_IPV4) $(legacy_value NODE_IPV6)"
+            ;;
+    esac
+
+    for v in $addr; do
+        v=${v#[}
+        v=${v%]}
+        if valid_host "$v"; then
+            m '.addresses += [$v] | .addresses |= unique' --arg v "$v"
+        fi
+    done
+
+    cert=$(jq -r '
+        [.inbounds[] | .tls.certificate_path? |
+         select(.!=null and .!="")][0] // empty' "$inbound")
+    key=$(jq -r '
+        [.inbounds[] | .tls.key_path? |
+         select(.!=null and .!="")][0] // empty' "$inbound")
+
+    if [[ -f "$cert" && -f "$key" ]]; then
+        v=$(new_uuid)
+        cp "$cert" "$W/certs/$v.pem"
+        cp "$key" "$W/certs/$v.key"
+        chmod 600 "$W/certs/$v.pem" "$W/certs/$v.key"
+
+        mstr '.tls.certificate=$v' "$W/certs/$v.pem"
+        mstr '.tls.key=$v' "$W/certs/$v.key"
+        m '.tls.mode="legacy" | .tls.sni="www.bing.com"'
+    fi
+
+    v=$(legacy_value ARGO_DOMAIN)
+    [[ -z "$v" ]] || mstr '.argo.domain=$v' "$v"
+
+    for file in /etc/systemd/system/argo.service /etc/init.d/argo; do
+        if [[ -f "$file" ]]; then
+            token=$(grep -oE -- \
+                '--token[ =]+[A-Za-z0-9_+/=-]+' "$file" |
+                sed -E 's/^--token[ =]+//' | head -n 1 || :)
+            if [[ -n "$token" ]]; then
+                mstr '.argo.token=$v' "$token"
+                m '.argo.mode="token"'
+                break
+            fi
+        fi
+    done
+
+    min=$(legacy_value HY2_MPORT_MIN)
+    max=$(legacy_value HY2_MPORT_MAX)
+    if valid_port "${min:-0}" && valid_port "${max:-0}"; then
+        if (( 10#$min <= 10#$max )); then
+            m '.hy2_hop={start:$a,end:$b}' \
+                --argjson a "$((10#$min))" --argjson b "$((10#$max))"
+        fi
+    fi
+
+    warn "旧版未记录规则归属的普通放行规则会保留，避免删除原有规则。"
+    warn "旧版共享 WARP 凭据不迁移；需要使用自己的 WireGuard 配置。"
+}
+
+begin_transaction() {
+    T=$(mktemp -d "$W/generations/.stage.XXXXXX")
+
+    if [[ -f "$W/current/state.json" ]]; then
+        jq -e '.schema==2' "$W/current/state.json" >/dev/null ||
+            die "不支持当前状态文件版本"
+        cp "$W/current/state.json" "$T/state.json"
+    else
+        base_state
+        migrate_legacy
+    fi
+
+    S="$T/state.json"
+
+    if [[ ! -s "$(jget '.tls.certificate')" ||
+          ! -s "$(jget '.tls.key')" ]]; then
+        make_certificate "$(jget '.tls.sni')"
+        mstr '.tls.certificate=$v' "$CERT_PATH"
+        mstr '.tls.key=$v' "$KEY_PATH"
+        m '.tls.mode="pinned"'
+    fi
+}
+
+need_current() {
+    [[ -f "$W/current/state.json" ]] ||
+        die "请先选择 1 安装或迁移"
+}
+
+network_dialog() {
+    local v4 v6 defaults value
+    local -a hosts
+
+    say ""
+    say "监听模式：1 IPv4  2 IPv6  3 双栈"
+    ask "请选择 [默认 3]："
+    case "$REPLY" in
+        1) m '.listen="0.0.0.0"' ;;
+        2|3|"") m '.listen="::"' ;;
+        *) die "监听模式无效" ;;
+    esac
+
+    defaults=$(jq -r '.addresses | join(" ")' "$T/state.json")
+
+    if [[ -z "$defaults" ]]; then
+        v4=$(fetch -4 --max-time 8 https://api.ipify.org 2>/dev/null || :)
+        v6=$(fetch -6 --max-time 8 https://api64.ipify.org 2>/dev/null || :)
+        defaults=""
+        valid_host "${v4:-/}" && defaults="$v4"
+        if valid_host "${v6:-/}" && [[ "$v6" == *:* ]]; then
+            defaults="${defaults:+$defaults }$v6"
+        fi
+    fi
+
+    ask "节点连接 IP/域名，多个用空格分隔 [${defaults:-请手动输入}]："
+    value=${REPLY:-$defaults}
+    [[ -n "$value" ]] || die "连接地址不能为空"
+
+    read -r -a hosts <<<"${value//,/ }"
+    m '.addresses=[]'
+
+    for value in "${hosts[@]}"; do
+        value=${value#[}
+        value=${value%]}
+        valid_host "$value" || die "地址格式无效：$value"
+        m '.addresses += [$v] | .addresses |= unique' --arg v "$value"
+    done
+
+    ask "节点名称 [$(jget '.name')]："
+    [[ -z "$REPLY" ]] || mstr '.name=$v' "$REPLY"
+}
+
+choose_port() {
+    local tag="$1" default="$2" value old
+    old=$(jq -r --arg tag "$tag" \
+        '.nodes[$tag].port // 0' "$T/state.json")
+
+    while :; do
+        ask "$tag 监听端口 [$default]："
+        value=${REPLY:-$default}
+
+        if ! valid_port "$value"; then
+            warn "请输入 1 到 65535 的端口"
+            continue
+        fi
+        value=$((10#$value))
+
+        if jq -e --arg tag "$tag" --argjson p "$value" '
+            any(.nodes | to_entries[];
+                .key!=$tag and .value.port==$p)
+        ' "$T/state.json" >/dev/null; then
+            warn "此端口已分配给其他协议"
+            continue
+        fi
+
+        if [[ "$value" != "$old" ]] &&
+           [[ -n "$(ss -H -lntu "sport = :$value" 2>/dev/null)" ]]; then
+            warn "此端口已被系统中的其他服务占用"
+            continue
+        fi
+
+        CHOSEN_PORT=$value
+        return 0
+    done
+}
+
+tag_from_number() {
+    case "$1" in
+        1) printf 'vless-reality\n' ;;
+        2) printf 'vmess-ws\n' ;;
+        3) printf 'hysteria2\n' ;;
+        4) printf 'tuic\n' ;;
+        5) printf 'anytls\n' ;;
+        6) printf 'socks5-in\n' ;;
+        7) printf 'shadowsocks-2022\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+protocol_list() {
+    say "1 VLESS-Reality   2 VMess-WS/Argo   3 Hysteria2"
+    say "4 TUIC-v5        5 AnyTLS          6 Socks5"
+    say "7 Shadowsocks-2022"
+}
+
+add_protocol() {
+    local tag="$1" default uuid password bytes method user
+
+    if jq -e --arg tag "$tag" '.nodes[$tag]!=null' \
+        "$T/state.json" >/dev/null; then
+        warn "$tag 已存在，已保留"
+        return 0
+    fi
+
+    default=$(random_port)
+    [[ "$tag" != vmess-ws ]] || default=8001
+    choose_port "$tag" "$default"
+
+    uuid=$(jget '.defaults.uuid')
+    password=$(jget '.defaults.password')
+
+    m '.nodes[$tag]={port:$p}' \
+        --arg tag "$tag" --argjson p "$CHOSEN_PORT"
+
+    case "$tag" in
+        vless-reality|vmess-ws)
+            printf '%s' "$uuid" > "$T/.value"
+            m '.nodes[$tag].uuid=$v' \
+                --arg tag "$tag" --rawfile v "$T/.value"
+            ;;
+        tuic)
+            printf '%s' "$uuid" > "$T/.value"
+            m '.nodes[$tag].uuid=$v' \
+                --arg tag "$tag" --rawfile v "$T/.value"
+            printf '%s' "$password" > "$T/.value"
+            m '.nodes[$tag].password=$v' \
+                --arg tag "$tag" --rawfile v "$T/.value"
+            ;;
+        hysteria2|anytls)
+            printf '%s' "$password" > "$T/.value"
+            m '.nodes[$tag].password=$v' \
+                --arg tag "$tag" --rawfile v "$T/.value"
+            ;;
+        socks5-in)
+            ask "Socks5 用户名 [sbuser]："
+            user=${REPLY:-sbuser}
+            mstr '.nodes["socks5-in"].user=$v' "$user"
+
+            secret "Socks5 密码 [回车随机生成]："
+            password=${REPLY:-$(openssl rand -hex 16)}
+            mstr '.nodes["socks5-in"].password=$v' "$password"
+            ;;
+        shadowsocks-2022)
+            say "SS2022：1 AES-128-GCM  2 AES-256-GCM  3 ChaCha20"
+            ask "请选择 [默认 1]："
+            bytes=16
+            case "$REPLY" in
+                2) method="2022-blake3-aes-256-gcm"; bytes=32 ;;
+                3) method="2022-blake3-chacha20-poly1305"; bytes=32 ;;
+                1|"") method="2022-blake3-aes-128-gcm" ;;
+                *) die "加密方式无效" ;;
+            esac
+            mstr '.nodes["shadowsocks-2022"].method=$v' "$method"
+            password=$(openssl rand -base64 "$bytes" | tr -d '\r\n')
+            mstr '.nodes["shadowsocks-2022"].key=$v' "$password"
+            ;;
+    esac
+
+    rm -f "$T/.value"
+}
+
+ensure_argo() {
+    local version arch name output info
+    jq -e '
+        .nodes["vmess-ws"]!=null and .argo.enabled
+    ' "$T/state.json" >/dev/null || return 0
+
+    version=$(jget '.argo.version')
+    if [[ -z "$version" ]]; then
+        info="$T/cloudflare-release.json"
+        fetch -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
+            -o "$info"
+        version=$(jq -r '.tag_name // empty' "$info")
+        [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            die "无法确定 cloudflared 官方稳定版本"
+        mstr '.argo.version=$v' "$version"
+    fi
+
+    output="$W/bin/cloudflared-$version"
+    if [[ -x "$output" && -f "$output.sha256" ]] &&
+       sha256sum -c "$output.sha256" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    arch=$(architecture)
+    case "$arch" in
+        armv6|armv7) arch=arm ;;
+        amd64|arm64|386) ;;
+        *) die "cloudflared 暂不支持当前脚本选择的架构：$arch" ;;
+    esac
+    name="cloudflared-linux-$arch"
+
+    download_verified "cloudflare/cloudflared" "$version" \
+        "$name" "$output.new"
+
+    chmod 700 "$output.new"
+    "$output.new" --version > "$T/cloudfl
