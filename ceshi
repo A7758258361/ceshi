@@ -5,12 +5,12 @@
 # ==========================================================
 mkdir -p /etc/sing-box
 
-if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "/bin/sb" ] && [ "$0" != "/usr/local/bin/sb" ]; then
+if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "/bin/sb" ]; then
     cat > /etc/sing-box/sb.sh << '===SB_MAIN_SCRIPT_EOF==='
 #!/usr/bin/env bash
 
 # =========================
-# sing-box 64M极简低内存多协议脚本 (安全加固 + 纯Base64输出 + 自动BBR版)
+# sing-box 64M极简低内存多协议脚本 (纯Base64输出 + 自动BBR版)
 # 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls | socks5 | ss2022
 # =========================
 
@@ -70,25 +70,6 @@ ensure_sb_links() {
 ensure_sb_links
 
 # =========================
-# 元数据持久化安全读写 (防 sed 与命令注入)
-# =========================
-save_meta() {
-    local key="$1"
-    local val="$2"
-    mkdir -p "$work_dir"
-    touch "$meta_file"
-    chmod 600 "$meta_file" 2>/dev/null || true
-    local tmp_meta="${meta_file}.tmp"
-    grep -v "^${key}=" "$meta_file" > "$tmp_meta" 2>/dev/null || true
-    printf '%s=%q\n' "$key" "$val" >> "$tmp_meta"
-    mv -f "$tmp_meta" "$meta_file"
-}
-
-load_meta() {
-    [ -f "$meta_file" ] && source "$meta_file"
-}
-
-# =========================
 # BBR 加速管理模块 (自动开启 / 参数关闭 / 状态检测)
 # =========================
 check_bbr_status() {
@@ -104,6 +85,7 @@ check_bbr_status() {
 
 enable_bbr() {
     yellow "正在开启 BBR 加速通道..."
+    # 尝试加载内核模块 (针对独立内核 KVM/Xen 小鸡)
     modprobe tcp_bbr >/dev/null 2>&1 || true
     modprobe sch_fq >/dev/null 2>&1 || true
 
@@ -113,6 +95,7 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
 
+    # 同步清理 /etc/sysctl.conf 中的冲突项并追加
     if [ -f /etc/sysctl.conf ]; then
         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
@@ -141,6 +124,7 @@ disable_bbr() {
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
     fi
 
+    # 恢复默认 cubic 与队列算法
     sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
     sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
     sysctl -p >/dev/null 2>&1 || true
@@ -171,23 +155,19 @@ manage_bbr_menu() {
 }
 
 # =========================
-# 64M 内存防崩溃与内核网络优化 (含磁盘空间预检)
+# 64M 内存防崩溃与内核网络优化
 # =========================
 optimize_low_memory() {
-    local mem_total swap_total free_disk_mb
+    local mem_total
     mem_total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 256)
+    local swap_total
     swap_total=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
-    free_disk_mb=$(df -Pm / 2>/dev/null | awk 'NR==2 {print int($4)}' || echo 0)
 
     sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
     sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
     sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
 
     if [ "$mem_total" -le 192 ] && [ "$swap_total" -lt 64 ]; then
-        if [ "$free_disk_mb" -lt 200 ]; then
-            yellow "检测到可用磁盘空间不足 (${free_disk_mb}MB < 200MB)，跳过创建 Swap 文件，仅使用 GOMEMLIMIT 保护内存。"
-            return 0
-        fi
         yellow "检测到物理内存较小 (${mem_total}MB)，尝试创建 128MB Swap 防崩溃..."
         if [ ! -f "$swap_file" ]; then
             dd if=/dev/zero of="$swap_file" bs=1M count=128 status=none 2>/dev/null || true
@@ -199,14 +179,33 @@ optimize_low_memory() {
                 green "128MB Swap 启用成功！"
             else
                 rm -f "$swap_file" >/dev/null 2>&1 || true
-                yellow "当前容器不支持挂载 Swap，已通过 GOMEMLIMIT + GOMAXPROCS 内存硬限制保障稳定运行。"
+                yellow "当前容器不支持挂载 Swap，已通过 GOMEMLIMIT 内存硬限制保障稳定运行。"
             fi
         fi
     fi
 }
 
 # =========================
-# 服务状态检测与管理 (双重校验二进制与服务定义文件)
+# 元数据持久化读写
+# =========================
+save_meta() {
+    local key="$1"
+    local val="$2"
+    mkdir -p "$work_dir"
+    touch "$meta_file"
+    if grep -q "^${key}=" "$meta_file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$meta_file"
+    else
+        echo "${key}=\"${val}\"" >> "$meta_file"
+    fi
+}
+
+load_meta() {
+    [ -f "$meta_file" ] && source "$meta_file"
+}
+
+# =========================
+# 服务状态检测与管理
 # =========================
 get_service_file() {
     case "$1" in
@@ -216,20 +215,11 @@ get_service_file() {
     esac
 }
 
-is_service_registered() {
-    local service_name="$1"
-    if command_exists rc-service; then
-        [ -f "/etc/init.d/${service_name}" ]
-    else
-        [ -f "/etc/systemd/system/${service_name}.service" ]
-    fi
-}
-
 check_service_raw() {
     local service_name="$1"
     local service_file="${2:-$(get_service_file "$service_name")}"
 
-    if [ -z "$service_file" ] || [ ! -x "$service_file" ] || ! is_service_registered "$service_name"; then
+    if [ -z "$service_file" ] || [ ! -f "$service_file" ]; then
         echo "not installed"
         return 2
     fi
@@ -269,13 +259,6 @@ manage_service() {
     local action="$2"
     local status
     status=$(check_service_raw "$service_name")
-
-    # 防止日志文件无限增长占满小鸡磁盘
-    if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
-        if [ -f "${work_dir}/sb.log" ] && [ "$(wc -c < "${work_dir}/sb.log" 2>/dev/null || echo 0)" -gt 1048576 ]; then
-            : > "${work_dir}/sb.log"
-        fi
-    fi
 
     case "$action" in
         "start")
@@ -372,12 +355,13 @@ get_isp_name() {
     local isp
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
         awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-        sed 's/[^a-zA-Z0-9_-]/_/g')
-    [ -z "$isp" ] && isp=$(hostname 2>/dev/null | sed 's/[^a-zA-Z0-9_-]/_/g' || echo "Node")
+        sed 's/ /_/g')
+    [ -z "$isp" ] && isp=$(hostname 2>/dev/null | sed 's/ /_/g' || echo "Node")
     save_meta "ISP_NAME" "$isp"
     echo "$isp"
 }
 
+# 交互式设置入站 IP 与监听栈 (IPv4 / IPv6 / 双栈)
 configure_inbound_stack_and_ip() {
     yellow "\n正在检测服务器 IPv4 / IPv6 地址..."
     local auto_v4 auto_v6
@@ -450,17 +434,16 @@ configure_inbound_stack_and_ip() {
             ;;
     esac
 
-    # 更新除 vmess-ws (固定本地回环 127.0.0.1) 以外的所有入站监听地址
     if [ -f "${conf_dir}/inbounds.json" ]; then
         load_meta
-        jq --arg lip "${LISTEN_IP:-::}" '(.inbounds[] | select(.tag != "vmess-ws") | .listen) = $lip' \
+        jq --arg lip "${LISTEN_IP:-::}" '(.inbounds[].listen) = $lip' \
             "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && \
             mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
     fi
 }
 
 # =========================
-# 防火墙放行、单端口撤销与全量清理
+# 防火墙放行与清理
 # =========================
 allow_port() {
     local has_ufw=0 has_firewalld=0 has_iptables=0 has_ip6tables=0
@@ -487,53 +470,6 @@ allow_port() {
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
 }
 
-revoke_port() {
-    local has_firewalld=0
-    command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
-
-    for rule in "$@"; do
-        local port=${rule%/*}
-        local proto=${rule#*/}
-        [ -z "$port" ] || [ -z "$proto" ] && continue
-
-        command_exists ufw && ufw delete allow in "${port}/${proto}" >/dev/null 2>&1 || true
-        [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-        command_exists iptables && iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-        command_exists ip6tables && ip6tables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-
-        if [ -f "$ports_file" ]; then
-            grep -vxF "${port}/${proto}" "$ports_file" > "${ports_file}.tmp" 2>/dev/null || true
-            mv -f "${ports_file}.tmp" "$ports_file"
-        fi
-    done
-    [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1 || true
-}
-
-clean_hy2_mport_rules() {
-    load_meta
-    local target_p="${HY2_MPORT_TARGET:-${HY2_PORT}}"
-    if [ -n "$HY2_MPORT_MIN" ] && [ -n "$HY2_MPORT_MAX" ] && [ -n "$target_p" ]; then
-        while command_exists iptables && iptables -t nat -C PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${target_p}" 2>/dev/null; do
-            iptables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${target_p}" >/dev/null 2>&1 || break
-        done
-        while command_exists ip6tables && ip6tables -t nat -C PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${target_p}" 2>/dev/null; do
-            ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${target_p}" >/dev/null 2>&1 || break
-        done
-    fi
-}
-
-apply_hy2_mport_rules() {
-    local min_p="$1"
-    local max_p="$2"
-    local target_p="$3"
-    clean_hy2_mport_rules
-    command_exists iptables && iptables -t nat -A PREROUTING -p udp --dport "${min_p}:${max_p}" -j DNAT --to-destination ":${target_p}" >/dev/null 2>&1 || true
-    command_exists ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport "${min_p}:${max_p}" -j DNAT --to-destination ":${target_p}" >/dev/null 2>&1 || true
-    save_meta "HY2_MPORT_MIN" "$min_p"
-    save_meta "HY2_MPORT_MAX" "$max_p"
-    save_meta "HY2_MPORT_TARGET" "$target_p"
-}
-
 clean_firewall_rules() {
     if [ -f "$ports_file" ]; then
         while IFS= read -r rule; do
@@ -547,28 +483,20 @@ clean_firewall_rules() {
         done < "$ports_file"
         command_exists firewall-cmd && firewall-cmd --reload >/dev/null 2>&1 || true
     fi
-    clean_hy2_mport_rules
-}
 
-# =========================
-# 端口输入与系统级冲突校验函数
-# =========================
-is_system_port_used() {
-    local p="$1"
-    if command_exists ss; then
-        ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "(:|\])${p}$" && return 0
-    elif command_exists lsof; then
-        lsof -i :"$p" >/dev/null 2>&1 && return 0
-    elif command_exists netstat; then
-        netstat -tuln 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])${p}$" && return 0
+    load_meta
+    if [ -n "$HY2_MPORT_MIN" ] && [ -n "$HY2_MPORT_MAX" ] && [ -n "$HY2_PORT" ]; then
+        command_exists iptables && iptables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${HY2_PORT}" >/dev/null 2>&1 || true
+        command_exists ip6tables && ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${HY2_PORT}" >/dev/null 2>&1 || true
     fi
-    return 1
 }
 
+# =========================
+# 端口输入与冲突校验函数
+# =========================
 prompt_custom_port() {
     local proto_title="$1"
     local default_p="$2"
-    local current_tag="${3:-}"
     local chosen_p=""
 
     while true; do
@@ -581,19 +509,8 @@ prompt_custom_port() {
         fi
 
         if [ -f "${conf_dir}/inbounds.json" ]; then
-            if jq -e --argjson p "$chosen_p" --arg ctag "$current_tag" '.inbounds[] | select(.tag != $ctag and .listen_port == $p)' "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
-                yellow "端口 ${chosen_p} 已被配置内其他入站协议占用，请重新指定！"
-                default_p=$(rand_port)
-                continue
-            fi
-        fi
-
-        # 检查是否被系统其他非 sing-box 进程占用
-        if is_system_port_used "$chosen_p"; then
-            if command_exists lsof && lsof -i :"$chosen_p" 2>/dev/null | grep -q "sing-box"; then
-                :
-            else
-                yellow "端口 ${chosen_p} 已被系统其他服务占用，请重新指定！"
+            if jq -e --argjson p "$chosen_p" '.inbounds[] | select(.listen_port == $p)' "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
+                yellow "端口 ${chosen_p} 已被其他入站协议占用，请重新指定！"
                 default_p=$(rand_port)
                 continue
             fi
@@ -615,130 +532,14 @@ get_arch() {
     esac
 }
 
-# =========================
-# 二进制安全下载与可执行性校验
-# =========================
-ensure_singbox_binary() {
-    if [ -x "${work_dir}/${server_name}" ] && "${work_dir}/${server_name}" version >/dev/null 2>&1; then
-        return 0
-    fi
-    local arch
-    arch=$(get_arch)
-    yellow "\n正在下载并校验 sing-box 核心组件..."
-    rm -f "${work_dir}/${server_name}"
-
-    curl -sLo "${work_dir}/${server_name}" "https://${arch}.eooce.com/sb"
-    chmod +x "${work_dir}/${server_name}" 2>/dev/null || true
-
-    if ! "${work_dir}/${server_name}" version >/dev/null 2>&1; then
-        red "错误: 下载的 sing-box 二进制文件损坏或无法在当前架构执行！"
-        rm -f "${work_dir}/${server_name}"
-        exit 1
-    fi
-}
-
 ensure_argo_binary() {
-    if [ -x "${work_dir}/argo" ] && "${work_dir}/argo" --version >/dev/null 2>&1; then
-        return 0
-    fi
-    local arch cf_arch
-    arch=$(get_arch)
-    case "$arch" in
-        amd64) cf_arch="amd64" ;;
-        386)   cf_arch="386" ;;
-        arm64) cf_arch="arm64" ;;
-        armv7) cf_arch="arm" ;;
-        *)     cf_arch="$arch" ;;
-    esac
-
-    yellow "正在下载并校验 Argo (cloudflared) 组件..."
-    rm -f "${work_dir}/argo"
-
-    # 优先尝试 GitHub 官方源，失败则回退镜像源，并严格校验可执行性
-    curl -sL --connect-timeout 5 -o "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" || true
-    chmod +x "${work_dir}/argo" 2>/dev/null || true
-
-    if ! "${work_dir}/argo" --version >/dev/null 2>&1; then
+    if [ ! -x "${work_dir}/argo" ]; then
+        local arch
+        arch=$(get_arch)
+        yellow "正在下载 Argo (cloudflared) 组件..."
         curl -sLo "${work_dir}/argo" "https://${arch}.eooce.com/bot"
-        chmod +x "${work_dir}/argo" 2>/dev/null || true
+        chmod +x "${work_dir}/argo"
     fi
-
-    if ! "${work_dir}/argo" --version >/dev/null 2>&1; then
-        red "错误: 下载的 Argo 组件损坏或无法执行！"
-        rm -f "${work_dir}/argo"
-        return 1
-    fi
-}
-
-# =========================
-# 动态生成独立 WARP WireGuard 节点配置 (避免全网共用私钥)
-# =========================
-generate_warp_endpoint() {
-    local ep_file="${conf_dir}/endpoints.json"
-    local wg_out priv_key pub_key reg_json v4_addr v6_addr client_id res_array
-
-    # 默认兜底参数
-    priv_key="YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY="
-    v4_addr="172.16.0.2/32"
-    v6_addr="2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-    res_array="[78, 135, 76]"
-
-    if [ -x "${work_dir}/${server_name}" ]; then
-        wg_out=$("${work_dir}/${server_name}" generate wg-keypair 2>/dev/null || true)
-        local gen_priv gen_pub
-        gen_priv=$(echo "$wg_out" | awk '/PrivateKey:/ {print $2}')
-        gen_pub=$(echo "$wg_out" | awk '/PublicKey:/ {print $2}')
-
-        if [ -n "$gen_priv" ] && [ -n "$gen_pub" ]; then
-            reg_json=$(curl -sm 5 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-                -H "Content-Type: application/json" \
-                -d "{\"key\":\"${gen_pub}\",\"install_id\":\"\",\"warp_enabled\":true,\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"type\":\"Android\",\"locale\":\"en_US\"}" 2>/dev/null || true)
-
-            local api_v4 api_v6
-            api_v4=$(echo "$reg_json" | jq -r '.config.interface.addresses.v4 // empty' 2>/dev/null)
-            api_v6=$(echo "$reg_json" | jq -r '.config.interface.addresses.v6 // empty' 2>/dev/null)
-            client_id=$(echo "$reg_json" | jq -r '.config.client_id // empty' 2>/dev/null)
-
-            if [ -n "$api_v4" ] && [ -n "$api_v6" ]; then
-                priv_key="$gen_priv"
-                v4_addr="${api_v4}/32"
-                v6_addr="${api_v6}/128"
-                if [ -n "$client_id" ] && command_exists od; then
-                    local b1 b2 b3
-                    read -r b1 b2 b3 <<< "$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null)"
-                    if [[ "$b1" =~ ^[0-9]+$ ]] && [[ "$b2" =~ ^[0-9]+$ ]] && [[ "$b3" =~ ^[0-9]+$ ]]; then
-                        res_array="[${b1}, ${b2}, ${b3}]"
-                    fi
-                fi
-            fi
-        fi
-    fi
-
-    cat > "$ep_file" << EOF
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "${v4_addr}",
-        "${v6_addr}"
-      ],
-      "private_key": "${priv_key}",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": ${res_array}
-        }
-      ]
-    }
-  ]
-}
-EOF
 }
 
 # =========================
@@ -763,7 +564,7 @@ add_proto_to_inbounds() {
             fi
             local def_port="${VLESS_PORT:-$(rand_port)}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "VLESS-Reality" "$def_port" "vless-reality"
+                prompt_custom_port "VLESS-Reality" "$def_port"
                 def_port="$Selected_Port"
             fi
             save_meta "VLESS_PORT" "$def_port"
@@ -799,21 +600,21 @@ add_proto_to_inbounds() {
             if proto_exists "vmess-ws"; then
                 yellow "vmess-ws 已存在，跳过添加。"; return 0
             fi
-            ensure_argo_binary || return 1
+            ensure_argo_binary
             local def_port="${VMESS_PORT:-8001}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "VMess-WS (Argo本地回环监听)" "$def_port" "vmess-ws"
+                prompt_custom_port "VMess-WS (Argo本地监听)" "$def_port"
                 def_port="$Selected_Port"
             fi
             save_meta "VMESS_PORT" "$def_port"
 
-            # 强制监听 127.0.0.1，严禁暴露公网及放行公网防火墙
-            jq --argjson port "$def_port" \
+            jq --arg listen "$listen_ip" \
+               --argjson port "$def_port" \
                --arg uuid "$UUID" \
                '.inbounds += [{
                    "type": "vmess",
                    "tag": "vmess-ws",
-                   "listen": "127.0.0.1",
+                   "listen": $listen,
                    "listen_port": $port,
                    "users": [{"uuid": $uuid}],
                    "transport": {
@@ -822,6 +623,7 @@ add_proto_to_inbounds() {
                        "early_data_header_name": "Sec-WebSocket-Protocol"
                    }
                }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+            allow_port "${def_port}/tcp"
             ;;
 
         hy2|hysteria2)
@@ -830,7 +632,7 @@ add_proto_to_inbounds() {
             fi
             local def_port="${HY2_PORT:-$(rand_port)}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "Hysteria2 (UDP)" "$def_port" "hysteria2"
+                prompt_custom_port "Hysteria2 (UDP)" "$def_port"
                 def_port="$Selected_Port"
             fi
             save_meta "HY2_PORT" "$def_port"
@@ -866,7 +668,7 @@ add_proto_to_inbounds() {
             fi
             local def_port="${TUIC_PORT:-$(rand_port)}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "TUIC-v5 (UDP)" "$def_port" "tuic"
+                prompt_custom_port "TUIC-v5 (UDP)" "$def_port"
                 def_port="$Selected_Port"
             fi
             save_meta "TUIC_PORT" "$def_port"
@@ -899,7 +701,7 @@ add_proto_to_inbounds() {
             fi
             local def_port="${ANYTLS_PORT:-$(rand_port)}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "AnyTLS (TCP)" "$def_port" "anytls"
+                prompt_custom_port "AnyTLS (TCP)" "$def_port"
                 def_port="$Selected_Port"
             fi
             save_meta "ANYTLS_PORT" "$def_port"
@@ -932,7 +734,7 @@ add_proto_to_inbounds() {
             local sk_user="${SOCKS_USER:-${UUID:0:8}}"
             local sk_pass="${SOCKS_PASS:-${UUID: -12}}"
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "Socks5" "$def_port" "socks5-in"
+                prompt_custom_port "Socks5" "$def_port"
                 def_port="$Selected_Port"
                 reading "请输入 Socks5 用户名 (直接回车默认 ${sk_user}): " input_u
                 [ -n "$input_u" ] && sk_user="$input_u"
@@ -965,7 +767,7 @@ add_proto_to_inbounds() {
             local ss_method="${SS_METHOD:-2022-blake3-aes-128-gcm}"
             local key_len=16
             if [ "$interactive" -eq 1 ]; then
-                prompt_custom_port "Shadowsocks-2022" "$def_port" "shadowsocks-2022"
+                prompt_custom_port "Shadowsocks-2022" "$def_port"
                 def_port="$Selected_Port"
                 green "请选择 SS2022 加密方式: 1. aes-128-gcm(默认)  2. aes-256-gcm  3. chacha20-poly1305"
                 reading "请输入选择 (回车默认1): " m_choice
@@ -1007,34 +809,18 @@ remove_proto_from_inbounds() {
         return 1
     fi
 
-    local old_port
-    old_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$inbounds_file")
-
     jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
         "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
 
-    # 自动回收对应的防火墙规则与端口跳跃规则
-    case "$tag" in
-        vless-reality|anytls) [ -n "$old_port" ] && revoke_port "${old_port}/tcp" ;;
-        hysteria2)
-            [ -n "$old_port" ] && revoke_port "${old_port}/udp"
-            clean_hy2_mport_rules
-            save_meta "HY2_MPORT_MIN" ""
-            save_meta "HY2_MPORT_MAX" ""
-            save_meta "HY2_MPORT_TARGET" ""
-            ;;
-        tuic) [ -n "$old_port" ] && revoke_port "${old_port}/udp" ;;
-        socks5-in|shadowsocks-2022) [ -n "$old_port" ] && revoke_port "${old_port}/tcp" "${old_port}/udp" ;;
-        vmess-ws)
-            stop_argo
-            if command_exists systemctl; then
-                systemctl disable argo >/dev/null 2>&1 || true
-            elif command_exists rc-update; then
-                rc-update del argo default >/dev/null 2>&1 || true
-            fi
-            yellow "已同步停止 Argo 进程释放内存。"
-            ;;
-    esac
+    if [ "$tag" == "vmess-ws" ]; then
+        stop_argo
+        if command_exists systemctl; then
+            systemctl disable argo >/dev/null 2>&1 || true
+        elif command_exists rc-update; then
+            rc-update del argo default >/dev/null 2>&1 || true
+        fi
+        yellow "已同步停止 Argo 进程释放内存。"
+    fi
     return 0
 }
 
@@ -1105,13 +891,7 @@ rebuild_urls() {
         save_meta "ARGO_DOMAIN" "$argodomain"
 
         local vmess_json
-        vmess_json=$(jq -cn \
-            --arg ps "${isp}-argo-vmess-ws" \
-            --arg add "$cfip" \
-            --arg port "$cfport" \
-            --arg id "$m_uuid" \
-            --arg host "$argodomain" \
-            '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto", net:"ws", type:"none", host:$host, path:"/vmess-argo?ed=2560", tls:"tls", sni:$host, alpn:"", fp:"firefox", allowInsecure:"false"}')
+        vmess_json="{ \"v\": \"2\", \"ps\": \"${isp}-argo-vmess-ws\", \"add\": \"${cfip}\", \"port\": \"${cfport}\", \"id\": \"${m_uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
         echo "vmess://$(printf '%s' "$vmess_json" | b64_encode)" >> "$client_dir"
     fi
 
@@ -1175,6 +955,7 @@ rebuild_urls() {
     fi
 }
 
+# 仅输出纯 Base64 编码
 check_nodes() {
     if [ ! -f "${sub_file}" ] || [ ! -s "${sub_file}" ]; then
         red "\n当前没有已生成的节点 Base64 数据，请先安装或添加协议。\n"
@@ -1216,16 +997,24 @@ install_singbox() {
     clear
     purple "=== 开始配置并安装 sing-box (64M轻量稳定版) ==="
 
+    # 搭建节点时自动开启 BBR 加速
     enable_bbr
+
     configure_inbound_stack_and_ip
 
     SELECTED_PROTOS=""
     select_install_protocols
 
+    local arch
+    arch=$(get_arch)
     mkdir -p "${work_dir}" "${conf_dir}"
     chmod 755 "${work_dir}"
 
-    ensure_singbox_binary
+    if [ ! -x "${work_dir}/${server_name}" ]; then
+        yellow "\n正在下载 sing-box 核心组件..."
+        curl -sLo "${work_dir}/sing-box" "https://${arch}.eooce.com/sb"
+        chmod +x "${work_dir}/${server_name}"
+    fi
 
     local uuid output private_key public_key fingerprint
     uuid=$(cat /proc/sys/kernel/random/uuid)
@@ -1244,8 +1033,6 @@ install_singbox() {
     save_meta "REALITY_SNI" "www.iij.ad.jp"
     save_meta "CFIP_SAVED" "$CFIP"
     save_meta "CFPORT_SAVED" "$CFPORT"
-    save_meta "ARGO_DOMAIN" ""
-    save_meta "ARGO_TOKEN" ""
 
     local dns_strategy="prefer_ipv4"
     load_meta
@@ -1313,7 +1100,31 @@ EOF
 }
 EOF
 
-    generate_warp_endpoint
+    cat > "${conf_dir}/endpoints.json" << EOF
+{
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wireguard-out",
+      "mtu": 1280,
+      "address": [
+        "172.16.0.2/32",
+        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
+      ],
+      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+      "peers": [
+        {
+          "address": "engage.cloudflareclient.com",
+          "port": 2408,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "reserved": [78, 135, 76]
+        }
+      ]
+    }
+  ]
+}
+EOF
 
     cat > "${conf_dir}/route.json" << EOF
 {
@@ -1326,20 +1137,9 @@ EOF
 EOF
 }
 
-# 统一生成 Argo 启动命令 (支持临时隧道与固定 Token，使用 exec 保证 PID 一致)
-get_argo_exec_cmd() {
+main_systemd_services() {
     load_meta
     local argo_p="${VMESS_PORT:-8001}"
-    if [ -n "$ARGO_TOKEN" ]; then
-        printf "exec /etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '%s' > /etc/sing-box/argo.log 2>&1" "${ARGO_TOKEN//\'/}"
-    else
-        printf "exec /etc/sing-box/argo tunnel --url http://127.0.0.1:%s --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1" "$argo_p"
-    fi
-}
-
-main_systemd_services() {
-    local argo_cmd
-    argo_cmd=$(get_argo_exec_cmd)
 
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -1351,7 +1151,6 @@ User=root
 WorkingDirectory=/etc/sing-box
 Environment="GOGC=30"
 Environment="GOMEMLIMIT=25MiB"
-Environment="GOMAXPROCS=1"
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/etc/sing-box/sing-box run -C /etc/sing-box/conf
@@ -1374,9 +1173,8 @@ Type=simple
 NoNewPrivileges=yes
 Environment="GOGC=20"
 Environment="GOMEMLIMIT=24MiB"
-Environment="GOMAXPROCS=1"
 TimeoutStartSec=0
-ExecStart=/bin/sh -c "${argo_cmd}"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:${argo_p} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 
@@ -1398,15 +1196,14 @@ EOF
 }
 
 alpine_openrc_services() {
-    local argo_cmd
-    argo_cmd=$(get_argo_exec_cmd)
+    load_meta
+    local argo_p="${VMESS_PORT:-8001}"
 
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
 description="sing-box service"
 export GOGC=30
 export GOMEMLIMIT=25MiB
-export GOMAXPROCS=1
 command="/etc/sing-box/sing-box"
 command_args="run -C /etc/sing-box/conf"
 command_background=true
@@ -1418,9 +1215,8 @@ EOF
 description="Cloudflare Tunnel"
 export GOGC=20
 export GOMEMLIMIT=24MiB
-export GOMAXPROCS=1
 command="/bin/sh"
-command_args="-c \"${argo_cmd}\""
+command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:${argo_p} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
@@ -1440,26 +1236,17 @@ EOF
 
 sync_argo_service() {
     if proto_exists "vmess-ws"; then
-        ensure_argo_binary || return 1
+        ensure_argo_binary
         if command_exists systemctl; then
             main_systemd_services
         elif command_exists rc-update; then
             alpine_openrc_services
         fi
-        load_meta
-        [ -z "$ARGO_TOKEN" ] && get_quick_tunnel
+        get_quick_tunnel
     fi
 }
 
 get_quick_tunnel() {
-    load_meta
-    if [ -n "$ARGO_TOKEN" ]; then
-        restart_argo
-        sleep 2
-        return 0
-    fi
-    save_meta "ARGO_DOMAIN" ""
-    : > "${work_dir}/argo.log" 2>/dev/null || true
     restart_argo
     yellow "正在获取 Argo 临时域名，请稍候..."
     sleep 3
@@ -1629,8 +1416,6 @@ manage_protocols() {
             check_nodes
             ;;
         3)
-            clean_firewall_rules
-            : > "$ports_file" 2>/dev/null || true
             configure_inbound_stack_and_ip
             SELECTED_PROTOS=""
             select_install_protocols
@@ -1700,7 +1485,7 @@ change_config() {
                 1) target_tag="vless-reality"; proto_type="tcp"; meta_key="VLESS_PORT" ;;
                 2) target_tag="hysteria2";     proto_type="udp"; meta_key="HY2_PORT" ;;
                 3) target_tag="tuic";          proto_type="udp"; meta_key="TUIC_PORT" ;;
-                4) target_tag="vmess-ws";      proto_type="local"; meta_key="VMESS_PORT" ;;
+                4) target_tag="vmess-ws";      proto_type="tcp"; meta_key="VMESS_PORT" ;;
                 5) target_tag="anytls";        proto_type="tcp"; meta_key="ANYTLS_PORT" ;;
                 6) target_tag="socks5-in";     proto_type="both"; meta_key="SOCKS_PORT" ;;
                 7) target_tag="shadowsocks-2022"; proto_type="both"; meta_key="SS_PORT" ;;
@@ -1709,44 +1494,24 @@ change_config() {
             if ! proto_exists "$target_tag"; then
                 red "\n当前未启用 [$target_tag] 协议！\n"; return
             fi
-
-            local old_port
-            old_port=$(jq -r --arg tag "$target_tag" '.inbounds[] | select(.tag == $tag).listen_port' "$inbounds_file")
-
-            prompt_custom_port "$target_tag" "$(rand_port)" "$target_tag"
+            prompt_custom_port "$target_tag" "$(rand_port)"
             local new_port="$Selected_Port"
             jq --arg tag "$target_tag" --argjson port "$new_port" \
                '(.inbounds[] | select(.tag == $tag).listen_port) = $port' \
                "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
             save_meta "$meta_key" "$new_port"
-
-            # 撤销旧端口防火墙并放行新端口
             if [ "$proto_type" == "both" ]; then
-                [ -n "$old_port" ] && revoke_port "${old_port}/tcp" "${old_port}/udp"
                 allow_port "${new_port}/tcp" "${new_port}/udp"
-            elif [ "$proto_type" == "local" ]; then
-                # vmess-ws 端口变更后同步重写 Argo 服务配置并重启 Argo
-                sync_argo_service
             else
-                [ -n "$old_port" ] && revoke_port "${old_port}/${proto_type}"
                 allow_port "${new_port}/${proto_type}"
             fi
-
-            # 若修改了 Hysteria2 端口且存在端口跳跃，自动同步更新 DNAT 目标端口
-            if [ "$target_tag" == "hysteria2" ] && [ -n "$HY2_MPORT_MIN" ] && [ -n "$HY2_MPORT_MAX" ]; then
-                apply_hy2_mport_rules "$HY2_MPORT_MIN" "$HY2_MPORT_MAX" "$new_port"
-            fi
-
             restart_singbox
             rebuild_urls
             check_nodes
             ;;
         2)
-            reading "\n请输入新的标准 UUID (直接回车随机生成): " new_uuid
-            if [ -z "$new_uuid" ] || [[ ! "$new_uuid" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
-                [ -n "$new_uuid" ] && yellow "输入的不是标准 36 位 UUID 格式，已自动生成合规 UUID！"
-                new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            fi
+            reading "\n请输入新的UUID (直接回车随机生成): " new_uuid
+            [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
             save_meta "UUID" "$new_uuid"
             jq --arg uuid "$new_uuid" \
                '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
@@ -1786,20 +1551,23 @@ change_config() {
             min_port="${min_port:-50000}"
             reading "请输入跳跃结束端口 (回车默认 $((min_port + 100))): " max_port
             max_port="${max_port:-$((min_port + 100))}"
-            if [[ ! "$min_port" =~ ^[0-9]+$ ]] || [[ ! "$max_port" =~ ^[0-9]+$ ]] || [ "$min_port" -ge "$max_port" ] || [ "$min_port" -lt 1 ] || [ "$max_port" -gt 65535 ]; then
-                red "端口范围无效！"; return
-            fi
             local listen_port
             listen_port=$(jq -r '.inbounds[] | select(.tag == "hysteria2").listen_port' "$inbounds_file")
-            apply_hy2_mport_rules "$min_port" "$max_port" "$listen_port"
+            command_exists iptables && iptables -t nat -A PREROUTING -p udp --dport "${min_port}:${max_port}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1
+            command_exists ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport "${min_port}:${max_port}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1
+            save_meta "HY2_MPORT_MIN" "$min_port"
+            save_meta "HY2_MPORT_MAX" "$max_port"
             rebuild_urls
             check_nodes
             ;;
         5)
-            clean_hy2_mport_rules
+            load_meta
+            if [ -n "$HY2_MPORT_MIN" ] && [ -n "$HY2_MPORT_MAX" ]; then
+                command_exists iptables && iptables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${HY2_PORT}" >/dev/null 2>&1 || true
+                command_exists ip6tables && ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_MPORT_MIN}:${HY2_MPORT_MAX}" -j DNAT --to-destination ":${HY2_PORT}" >/dev/null 2>&1 || true
+            fi
             save_meta "HY2_MPORT_MIN" ""
             save_meta "HY2_MPORT_MAX" ""
-            save_meta "HY2_MPORT_TARGET" ""
             rebuild_urls
             check_nodes
             ;;
@@ -1847,27 +1615,23 @@ manage_argo() {
     green "1. 启动 Argo   2. 停止 Argo   3. 重新获取临时域名   4. 配置固定隧道   0. 返回"
     reading "请输入选择: " choice
     load_meta
+    local argo_p="${VMESS_PORT:-8001}"
     case "$choice" in
-        1) ensure_argo_binary && start_argo ;;
+        1) ensure_argo_binary; start_argo ;;
         2) stop_argo ;;
-        3)
-            ensure_argo_binary || return
-            save_meta "ARGO_TOKEN" ""
-            sync_argo_service
-            rebuild_urls
-            check_nodes
-            ;;
+        3) ensure_argo_binary; get_quick_tunnel; rebuild_urls; check_nodes ;;
         4)
-            ensure_argo_binary || return
+            ensure_argo_binary
             reading "请输入 Argo 固定域名: " argo_domain
             reading "请输入 Argo Token: " argo_auth
             [ -z "$argo_domain" ] || [ -z "$argo_auth" ] && return
             save_meta "ARGO_DOMAIN" "$argo_domain"
-            save_meta "ARGO_TOKEN" "$argo_auth"
-            sync_argo_service
-            sleep 2
-            rebuild_urls
-            check_nodes
+            if command_exists rc-service; then
+                sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth > /etc/sing-box/argo.log 2>&1'\"" /etc/init.d/argo
+            else
+                sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '"$argo_auth"' > /etc/sing-box/argo.log 2>&1"' /etc/systemd/system/argo.service
+            fi
+            restart_argo; sleep 2; rebuild_urls; check_nodes
             ;;
     esac
 }
@@ -1893,7 +1657,7 @@ warp_manage() {
     local route_file="${conf_dir}/route.json"
     clear; echo ""
     green "=== WARP 分流管理 ===\n"
-    green "1. 添加分流服务 (走WARP)   2. 重新生成独立WARP账户密钥   3. 清空分流恢复直连 (释放内存)   0. 返回"
+    green "1. 添加分流服务 (走WARP)   2. 清空分流恢复直连 (释放内存)   0. 返回"
     reading "请输入选择: " choice
     case "$choice" in
         1)
@@ -1922,12 +1686,6 @@ warp_manage() {
             green "已启用 ${r_tag} WARP分流！"
             ;;
         2)
-            yellow "正在向 Cloudflare 注册全新独立 WARP 账户与密钥..."
-            generate_warp_endpoint
-            restart_singbox
-            green "独立 WARP 账户配置已更新并生效！"
-            ;;
-        3)
             cat > "${route_file}" << 'EOF'
 {
   "route": {
@@ -2018,8 +1776,6 @@ case "$1" in
                     if [ "$(check_service_raw sing-box)" == "running" ]; then
                         reading "检测到 sing-box 已在运行，是否覆盖重新安装并重设端口/协议？(y/n): " reinstall_yn
                         [[ ! "$reinstall_yn" =~ ^[yY]$ ]] && continue
-                        clean_firewall_rules
-                        : > "$ports_file" 2>/dev/null || true
                     fi
                     manage_packages install jq tar openssl lsof coreutils curl
                     install_singbox
@@ -2080,9 +1836,4 @@ if ! command -v bash >/dev/null 2>&1; then
     fi
 fi
 
-# 仅在交互式无参数菜单且存在 /dev/tty 时重定向输入，确保后台定时任务与远程 SSH 参数调用正常
-if [ "$#" -eq 0 ] && [ -c /dev/tty ]; then
-    exec bash /etc/sing-box/sb.sh < /dev/tty
-else
-    exec bash /etc/sing-box/sb.sh "$@"
-fi
+exec bash /etc/sing-box/sb.sh "$@" < /dev/tty
